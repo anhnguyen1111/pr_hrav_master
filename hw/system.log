@@ -1,0 +1,5 @@
+rm -f *.log
+rm -f *.make
+rm -f system.mss
+rm -f data/system.ucf
+Done!

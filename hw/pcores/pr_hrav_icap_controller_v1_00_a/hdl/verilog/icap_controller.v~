@@ -1,0 +1,216 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date:    21:34:00 04/01/2015 
+// Design Name: 
+// Module Name:    icap_controller 
+// Project Name: 
+// Target Devices: 
+// Tool versions: 
+// Description:    This module is to control write/read bitstream to ICAP primitive
+// Dependencies:
+//
+// Revision: 
+// Revision 0.01 - File Created
+// Additional Comments: 
+//
+//////////////////////////////////////////////////////////////////////////////////
+module icap_controller 
+	(
+		// ADD USER PORTS BELOW THIS LINE 
+		input ICAP_clock,				//ICAP_CLK - or in the future can make a clock generator in this module
+    input ICAP_reset_n,
+
+		// ADD USER PORTS ABOVE THIS LINE 
+    input   dbg_icap_ce,
+    input   dbg_icap_write,
+    input   dbg_icap_data_in,
+    output  dbg_icap_data_out,
+    output  dbg_icap_busy, 
+
+    output [31:0] no_config_pkt,
+    output [31:0] no_config_byte,
+    output [1:0]  icap_config_state,
+
+    input  [23:0] icap_magic_code,
+		
+		// DO NOT EDIT BELOW THIS LINE ////////////////////
+		// Bus protocol ports, do not add or delete. 
+		input ACLK,
+		input ARESETN,
+
+		input  [255:0]  S_AXIS_TDATA,
+		input           S_AXIS_TLAST,
+		input           S_AXIS_TVALID,
+    input  [127:0]  S_AXIS_TUSER,
+    input  [31:0]   S_AXIS_TSTRB,
+		output          S_AXIS_TREADY,
+
+		output  [255:0] M_AXIS_TDATA,
+		output          M_AXIS_TLAST,
+		output          M_AXIS_TVALID,
+    output  [127:0] M_AXIS_TUSER,
+    output  [31:0]  M_AXIS_TSTRB,
+		input           M_AXIS_TREADY
+		// DO NOT EDIT ABOVE THIS LINE ////////////////////
+	);
+
+// ADD USER PARAMETERS BELOW THIS LINE 
+	localparam	DATA_WIDTH = 256;
+	localparam	ARRAY_SIZE = 4;
+	localparam  ICAP_DATA_WIDTH = 32;
+// ADD USER PARAMETERS ABOVE THIS LINE
+	
+//----------------------------------------
+// Implementation Section
+//----------------------------------------
+// 
+
+  wire [7:0] in_strb = {  S_AXIS_TSTRB[28], S_AXIS_TSTRB[24], S_AXIS_TSTRB[20], S_AXIS_TSTRB[16]
+                        , S_AXIS_TSTRB[12], S_AXIS_TSTRB[8], S_AXIS_TSTRB[4], S_AXIS_TSTRB[0]};
+
+  wire fifo_ready, fifo_valid;
+  wire [31:0] fifo_wdata, fifo_rdata;
+  wire config_start, config_end;
+
+  icap_data_size_converter #(DATA_WIDTH, ICAP_DATA_WIDTH) icap_data_size_converter (
+		.clock(ACLK),
+		.rst_n(ARESETN),
+    
+    // 256bit FIFO interface
+		.in_valid (S_AXIS_TVALID),
+		.in_data  (S_AXIS_TDATA),
+    .in_strb  (in_strb), // Assume data is multiple of 4 bytes
+    .in_user  (S_AXIS_TUSER),
+    .in_last  (S_AXIS_TLAST),
+		.out_ready(S_AXIS_TREADY),
+    
+    // 32-bit ICAP interfce
+    .in_ready  (fifo_ready),
+		.out_data  (fifo_wdata),
+		.out_valid (fifo_valid),
+
+    // Internal interface
+    .config_start   (config_start),
+    .config_end     (config_end),
+    .no_config_pkt  (no_config_pkt),
+    .no_config_byte (no_config_byte)
+  );
+
+  wire wfull, rempty;
+  wire icap_ce, icap_write
+  wire [31:0] icap_i, icap_o;
+  wire icap_busy;
+
+  wire fifo_ready = ~wfull;
+  wire winc = fifo_valid & fifo_ready;
+  wire rinc = ~icap_busy & ~rempty;
+
+	ASYN_fifo #(ICAP_DATA_WIDTH, ARRAY_SIZE) asyn_fifo_0
+	(
+		.wfull(wfull),		//1: full;  0: non full
+    .wdata(fifo_wdata),
+    .winc(winc),
+    .wclk(ACLK), .wrst_n(ARESETN),
+
+		.rempty(rempty),	//1: empty; 0: non empty + wait for 2 more clock to change the flag (for synchronous with wclk)
+    .rdata(fifo_rdata),
+		.rinc(fifo_read_inc), 
+    .rclk(ICAP_clock), .rrst_n( ICAP_reset_n)
+	);
+  
+	assign icap_ce = rempty & dbg_icap_ce;
+  assign icap_write = dbg_icap_write | ~rempty;
+  assign icap_i     = dbg_icap_ce ? fifo_rdata : dbg_icap_data_in;
+  assign dbg_icap_data_out = icap_o;
+  assign dbg_icap_busy     = icap_busy;
+
+	ICAP_VIRTEX5 #(.ICAP_WIDTH("X32")) ICAP_VIRTEX5_inst 
+	(
+		.CLK(ICAP_clock),			// 1-bit input: Clock Input
+		.CE(icap_ce),				  // 1-bit input: Active-Low ICAP input Enable
+		.WRITE(icap_write),	  // 1-bit input: Read/Write Select input
+		.I(icap_i),						// ICAP_WIDTH - bit input: Configuration data input bus
+		.O(icap_o),				    // ICAP_WIDTH -bit output: Configuration data output bus
+		.BUSY(icap_busy)			// 1-bit output: Busy/Ready output
+	); 
+
+  // Control FSM
+  localparam IDLE = 2'b00;
+  localparam RECV_FIRST_PKT = 2'b01;
+  localparam RECV_END_PKT   = 2'b10;
+  localparam SEND_CONFIG_DONE = 2'b11;
+
+  // Wait counter
+  localparam WAIT_CYCLE = 4'hF;
+
+	reg [1 : 0] state, next_state;
+  reg [3 :0]  wait_cnt, next_wait_cnt;
+  reg [127:16] save_tuser, next_save_tuser;
+  wire wait_cnt_expr = (wait_cnt == WAIT_CYCLE);
+  wire sync_rempty;
+  single_bit_sync_n (.clk(ACLK), .rst_n(ARESETN), .in_sig(rempty), .out_sig(sync_rempty));
+	always @(posedge ACLK)	begin
+		if (~ARESETN) begin
+      state <= IDLE;
+      wait_cnt <= 4'h0;
+      save_tuser <= 112'h0;
+    end
+    else begin
+      state <= next_state;
+      wait_cnt <= next_wait_cnt;
+      save_tuser <= next_save_tuser;
+    end
+	end
+  
+  reg m_tvalid;
+  always @* begin
+    next_state = state;
+    next_wait_cnt = wait_cnt;
+    next_tsave_user = tsave_user;
+    m_tvalid = 1'b0;
+    case (state)
+    IDLE: begin
+      if (start_config) begin
+        next_state = RECV_FIRST_PKT;
+        next_tsave_user = S_AXIS_TUSER[127:16];
+      end
+    end
+    RECV_FIRST_PKT: begin
+      if (end_config) begin
+        next_state = RECV_END_PKT;
+        next_wait_cnt = wait_cnt + 1'b1;
+      end
+    end
+    RECV_END_PKT: begin
+      if (wait_cnt_expr & ~sync_rempty) begin
+        next_state = SEND_CONFIG_DONE;
+        next_wait_cnt = 4'h0;
+      end
+    end
+    SEND_CONFIG_DONE: begin
+      m_tvalid = 1'b1;
+      if (M_AXIS_TREADY) next_state = IDLE;
+    end
+    endcase
+  end
+  assign icap_config_state = state;
+
+  // Configuration done packet
+  assign M_AXIS_TDATA[31:0] = {8'h03, icap_magic_code};
+  assign M_AXIS_TDATA[63:32] = {8'h03, 24'h0};
+  assign M_AXIS_TDATA[95:64] =  no_config_pkt;
+  assign M_AXIS_TDATA[127:96] = no_config_byte;
+  assign M_AXIS_TDATA[253:128] = 126'h0;
+  assign M_AXIS_TDATA[255:254] = state;
+  assign M_AXIS_TLAST = 1'b1;
+	assign M_AXIS_TVALID = m_tvalid;
+  assign M_AXIS_TUSER[15:0] = 16'h0020; // 32-byte
+  assign M_AXIS_TUSER[23:16] = save_tuser[31:24]; // Swap source and dest
+  assign M_AXIS_TUSER[31:24] = save_tuser[23:16];
+  assign M_AXIS_TUSER[127:32] = save_tuser[127:32]; // Copy same as the input
+  assign M_AXIS_TSTRB = 32'hFFFF_FFFF; // All bytes are valid
+
+endmodule
